@@ -7,5 +7,5 @@ export const {
   CH_ALINHAMENTOS,
   CH_REUNIAO,
   CH_INATIVIDADE,
-  CH_COFFEE
+  CH_COFFEE,
 } = process.env;

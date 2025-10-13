@@ -6,11 +6,8 @@ async function main() {
     console.error('[erro] DISCORD_TOKEN não configurado no .env');
     process.exit(1);
   }
-
   const client = createClient();
   await client.login(DISCORD_TOKEN);
 }
 
-main().catch((err) => {
-  console.error('[erro geral]', err);
-});
+main().catch((err) => console.error('[erro geral]', err));
