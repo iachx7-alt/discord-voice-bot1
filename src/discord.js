@@ -11,7 +11,11 @@ import {
 } from './config.js';
 
 // ------- util -------
-const SESSIONS = new Map(); // userId -> ISO de início da sessão
+/**
+ * SESSIONS guarda, por usuário:
+ * { startISO: string, channelId: string, channelName: string }
+ */
+const SESSIONS = new Map();
 
 const WATCHED_CHANNELS = new Set(
   [CH_SALES_ON, CH_ALINHAMENTOS, CH_REUNIAO, CH_INATIVIDADE, CH_COFFEE].filter(Boolean)
@@ -53,6 +57,35 @@ async function sendRow(row) {
   console.log('[webhook] evento enviado:', payload);
 }
 
+/**
+ * Fecha a sessão atual do usuário (se existir) e envia um LEAVE com a duração daquela sala.
+ */
+async function closeCurrentSessionAndSend(userId, username, endISO) {
+  const sess = SESSIONS.get(userId);
+  if (!sess) return;
+
+  const startISO = sess.startISO;
+  const channelName = sess.channelName || '';
+  let durationHuman = '';
+
+  if (startISO) {
+    const seconds = (new Date(endISO) - new Date(startISO)) / 1000;
+    durationHuman = formatDuration(seconds);
+  }
+
+  await sendRow({
+    ts: endISO,
+    username,
+    action: 'LEAVE',
+    channelName,
+    sessionStart: startISO,
+    sessionEnd: endISO,
+    durationHuman,
+  });
+
+  SESSIONS.delete(userId);
+}
+
 // ------- discord client -------
 export function createClient() {
   const client = new Client({
@@ -91,55 +124,49 @@ export function createClient() {
     });
 
     try {
-      // Entrou em canal monitorado (não monitorado -> monitorado)
+      const username = user.globalName || user.username;
+
+      // não monitorado -> monitorado  (abre sessão + JOIN)
       if (!isOldWatched && isNewWatched) {
-        SESSIONS.set(user.id, ts);
+        SESSIONS.set(user.id, { startISO: ts, channelId: newId, channelName: newName });
         await sendRow({
           ts,
-          username: user.globalName || user.username,
+          username,
           action: 'JOIN',
           channelName: newName,
           sessionStart: ts,
           sessionEnd: null,
           durationHuman: '',
         });
+        return;
       }
 
-      // Saiu de canal monitorado (monitorado -> não monitorado)
+      // monitorado -> não monitorado  (fecha sessão + LEAVE com duração)
       if (isOldWatched && !isNewWatched) {
-        const start = SESSIONS.get(user.id) || null;
-        const end = ts;
-        let durationHuman = '';
-
-        if (start) {
-          const seconds = (new Date(end) - new Date(start)) / 1000;
-          durationHuman = formatDuration(seconds);
-        }
-        SESSIONS.delete(user.id);
-
-        await sendRow({
-          ts: end,
-          username: user.globalName || user.username,
-          action: 'LEAVE',
-          channelName: oldName,
-          sessionStart: start,
-          sessionEnd: end,
-          durationHuman,
-        });
+        await closeCurrentSessionAndSend(user.id, username, ts);
+        return;
       }
 
-      // Move interno (monitorado->monitorado ou não->não): apenas registra
-      if ((isOldWatched && isNewWatched) || (!isOldWatched && !isNewWatched)) {
+      // monitorado -> monitorado  (fecha sessão antiga com LEAVE + abre nova com JOIN)
+      if (isOldWatched && isNewWatched) {
+        await closeCurrentSessionAndSend(user.id, username, ts); // LEAVE da sala antiga
+
+        // abre nova sessão para a sala de destino
+        SESSIONS.set(user.id, { startISO: ts, channelId: newId, channelName: newName });
+
         await sendRow({
           ts,
-          username: user.globalName || user.username,
-          action: 'MOVE',
-          channelName: newName || oldName,
-          sessionStart: null,
+          username,
+          action: 'JOIN',
+          channelName: newName,
+          sessionStart: ts,
           sessionEnd: null,
           durationHuman: '',
         });
+        return;
       }
+
+      // não monitorado -> não monitorado: ignora
     } catch (err) {
       console.error('[voice] erro no handler:', err);
     }
