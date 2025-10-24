@@ -1,3 +1,4 @@
+// src/config.js
 import 'dotenv/config';
 
 export const {
@@ -8,4 +9,5 @@ export const {
   CH_REUNIAO,
   CH_INATIVIDADE,
   CH_COFFEE,
+  SOURCE,
 } = process.env;

@@ -42,7 +42,12 @@ function formatDuration(seconds) {
 }
 
 async function sendRow(row) {
+  // id único do evento (bom para Sheets/n8n não sobrescrever linhas)
+  const eventId = `${Date.now()}-${row.action}-${row.username}-${Math.random()
+    .toString(36).slice(2, 8)}`;
+
   const payload = {
+    eventId,
     timestampLocal: tsLocal(row.ts),
     username: row.username,
     action: row.action,
@@ -72,6 +77,16 @@ async function closeCurrentSessionAndSend(userId, username, endISO) {
     const seconds = (new Date(endISO) - new Date(startISO)) / 1000;
     durationHuman = formatDuration(seconds);
   }
+
+  // 👇 debug: ver duração calculada a cada fechamento de sala
+  console.log('[session] FECHA', {
+    userId,
+    username,
+    channelName,
+    startISO,
+    endISO,
+    durationHuman,
+  });
 
   await sendRow({
     ts: endISO,
