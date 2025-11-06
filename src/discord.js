@@ -8,12 +8,16 @@ import {
   CH_REUNIAO,
   CH_INATIVIDADE,
   CH_COFFEE,
+  SOURCE,
 } from './config.js';
 
-// ------- util -------
+// --------- estado de sessão por usuário ---------
 /**
- * SESSIONS guarda, por usuário:
- * { startISO: string, channelId: string, channelName: string }
+ * SESSIONS[userId] = {
+ *   channelId: string,
+ *   channelName: string,
+ *   startISO: string
+ * }
  */
 const SESSIONS = new Map();
 
@@ -21,6 +25,7 @@ const WATCHED_CHANNELS = new Set(
   [CH_SALES_ON, CH_ALINHAMENTOS, CH_REUNIAO, CH_INATIVIDADE, CH_COFFEE].filter(Boolean)
 );
 
+// --------- helpers básicos ---------
 function nowISO() {
   return new Date().toISOString();
 }
@@ -42,14 +47,11 @@ function formatDuration(seconds) {
 }
 
 async function sendRow(row) {
-  // id único do evento (bom para Sheets/n8n não sobrescrever linhas)
-  const eventId = `${Date.now()}-${row.action}-${row.username}-${Math.random()
-    .toString(36).slice(2, 8)}`;
-
   const payload = {
-    eventId,
+    source: SOURCE || 'VPS',
     timestampLocal: tsLocal(row.ts),
     username: row.username,
+    userId: row.userId,
     action: row.action,
     channelName: row.channelName ?? '',
     durationHuman: row.durationHuman ?? '',
@@ -59,18 +61,17 @@ async function sendRow(row) {
 
   console.log('[event]', payload);
   await postWebhook(WEBHOOK_URL, payload);
-  console.log('[webhook] evento enviado:', payload);
+  console.log('[webhook] enviado');
 }
 
 /**
- * Fecha a sessão atual do usuário (se existir) e envia um LEAVE com a duração daquela sala.
+ * Fecha a sessão atual do usuário (se existir) e envia um LEAVE com duração.
  */
-async function closeCurrentSessionAndSend(userId, username, endISO) {
+async function closeSessionAndSend(userId, username, endISO, reason = '') {
   const sess = SESSIONS.get(userId);
   if (!sess) return;
 
-  const startISO = sess.startISO;
-  const channelName = sess.channelName || '';
+  const { channelId, channelName, startISO } = sess;
   let durationHuman = '';
 
   if (startISO) {
@@ -78,19 +79,21 @@ async function closeCurrentSessionAndSend(userId, username, endISO) {
     durationHuman = formatDuration(seconds);
   }
 
-  // 👇 debug: ver duração calculada a cada fechamento de sala
-  console.log('[session] FECHA', {
+  console.log('[session] CLOSE', {
     userId,
     username,
+    channelId,
     channelName,
     startISO,
     endISO,
     durationHuman,
+    reason,
   });
 
   await sendRow({
     ts: endISO,
     username,
+    userId,
     action: 'LEAVE',
     channelName,
     sessionStart: startISO,
@@ -101,7 +104,15 @@ async function closeCurrentSessionAndSend(userId, username, endISO) {
   SESSIONS.delete(userId);
 }
 
-// ------- discord client -------
+/**
+ * Abre uma nova sessão para o usuário na sala informada.
+ */
+function openSession(userId, channelId, channelName, startISO) {
+  SESSIONS.set(userId, { channelId, channelName, startISO });
+  console.log('[session] OPEN', { userId, channelId, channelName, startISO });
+}
+
+// --------- cliente discord ---------
 export function createClient() {
   const client = new Client({
     intents: [
@@ -113,16 +124,17 @@ export function createClient() {
 
   client.once(Events.ClientReady, (c) => {
     console.log('[bot] Logado como', `${c.user.username}#${c.user.discriminator}`);
+    console.log('[config] SOURCE:', SOURCE || 'VPS');
     console.log('[config] WATCHED_CHANNELS:', [...WATCHED_CHANNELS]);
     if (!WEBHOOK_URL) console.warn('[config] WEBHOOK_URL vazio! Não enviará ao n8n.');
   });
 
   client.on(Events.VoiceStateUpdate, async (oldS, newS) => {
-    // ignorar se nada mudou
+    // se não mudou de canal, ignora
     if (oldS.channelId === newS.channelId) return;
 
     const user = newS.member?.user ?? oldS.member?.user;
-    if (!user || user.bot) return;
+    if (!user || user.bot) return; // só humanos
 
     const ts = nowISO();
 
@@ -134,54 +146,77 @@ export function createClient() {
     const isOldWatched = oldId ? WATCHED_CHANNELS.has(oldId) : false;
     const isNewWatched = newId ? WATCHED_CHANNELS.has(newId) : false;
 
-    console.log('[debug] voice move:', {
-      user: user.username, oldId, oldName, newId, newName, isOldWatched, isNewWatched,
+    const username = user.globalName || user.username;
+
+    console.log('[debug] move', {
+      user: username,
+      oldId,
+      oldName,
+      newId,
+      newName,
+      isOldWatched,
+      isNewWatched,
     });
 
     try {
-      const username = user.globalName || user.username;
-
-      // não monitorado -> monitorado  (abre sessão + JOIN)
+      // CASO 1: fora -> canal monitorado (abre sessão + JOIN)
       if (!isOldWatched && isNewWatched) {
-        SESSIONS.set(user.id, { startISO: ts, channelId: newId, channelName: newName });
+        // se por algum motivo já tinha sessão aberta, fecha antes
+        if (SESSIONS.has(user.id)) {
+          await closeSessionAndSend(user.id, username, ts, 'stale-before-join');
+        }
+
+        openSession(user.id, newId, newName, ts);
+
         await sendRow({
           ts,
           username,
+          userId: user.id,
           action: 'JOIN',
           channelName: newName,
           sessionStart: ts,
           sessionEnd: null,
           durationHuman: '',
         });
+
         return;
       }
 
-      // monitorado -> não monitorado  (fecha sessão + LEAVE com duração)
+      // CASO 2: canal monitorado -> fora (fecha sessão + LEAVE)
       if (isOldWatched && !isNewWatched) {
-        await closeCurrentSessionAndSend(user.id, username, ts);
+        await closeSessionAndSend(user.id, username, ts, 'left-watched');
         return;
       }
 
-      // monitorado -> monitorado  (fecha sessão antiga com LEAVE + abre nova com JOIN)
+      // CASO 3: canal monitorado -> outro canal monitorado
+      // LEAVE da sala antiga + JOIN da nova
       if (isOldWatched && isNewWatched) {
-        await closeCurrentSessionAndSend(user.id, username, ts); // LEAVE da sala antiga
+        // fecha sessão antiga calculando duração daquela sala
+        await closeSessionAndSend(user.id, username, ts, 'switch-watched');
 
-        // abre nova sessão para a sala de destino
-        SESSIONS.set(user.id, { startISO: ts, channelId: newId, channelName: newName });
+        // abre sessão nova na sala de destino
+        openSession(user.id, newId, newName, ts);
 
+        // registra JOIN na nova sala
         await sendRow({
           ts,
           username,
+          userId: user.id,
           action: 'JOIN',
           channelName: newName,
           sessionStart: ts,
           sessionEnd: null,
           durationHuman: '',
         });
+
         return;
       }
 
-      // não monitorado -> não monitorado: ignora
+      // CASO 4: fora -> fora (não monitorado): não faz nada
+      // mas, se existir sessão aberta, fecha pra não ficar “fantasma”
+      if (!isOldWatched && !isNewWatched && SESSIONS.has(user.id)) {
+        await closeSessionAndSend(user.id, username, ts, 'fallback-out-of-watched');
+      }
     } catch (err) {
       console.error('[voice] erro no handler:', err);
     }
